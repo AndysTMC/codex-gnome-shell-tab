@@ -67,3 +67,7 @@ codex plugin marketplace remove local-gnome-shell
 - Develop, test, and package a release. [Contributing](CONTRIBUTING.md)
 - Understand the guest boundary and report a vulnerability. [Security](SECURITY.md)
 - Review release changes. [Changelog](CHANGELOG.md)
+
+## License
+
+Licensed under the [MIT License](LICENSE).
