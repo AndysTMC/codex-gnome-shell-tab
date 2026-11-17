@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GNOME Shell</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    font: 14px var(--font-sans, system-ui, sans-serif);
+    background: var(--color-background-primary, light-dark(#fbfbfc, #141414));
+    color: var(--color-text-primary, light-dark(#22242a, #efeff0));
+  }
+  body { margin: 0; }
+  main {
+    box-sizing: border-box; height: 100dvh; display: grid; gap: 8px;
+    grid-template-rows: minmax(0, 1fr) auto;
+    padding: calc(10px + var(--safe-top, 0px)) calc(10px + var(--safe-right, 0px))
+      calc(10px + var(--safe-bottom, 0px)) calc(10px + var(--safe-left, 0px));
+  }
+  #stage { display: grid; place-items: center; min-width: 0; container-type: size; }
+  #placeholder { width: min(100%, 340px); max-height: 100%; overflow: auto; text-align: center; }
+  #status { margin: 12px 0 0; }
+  #spinner {
+    display: inline-block; width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid currentColor; border-right-color: transparent;
+    animation: spin .8s linear infinite; opacity: .64;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { #spinner { animation: none; } }
+  #toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  #note { min-width: 0; max-height: min(96px, 20vh); overflow: auto; font-size: 12px; }
+  #note p { margin: 0; overflow-wrap: anywhere; }
+  button {
+    font: inherit; font-size: 12px; font-weight: 550; line-height: 18px; white-space: nowrap;
+    padding: 5px 10px; border-radius: 7px; cursor: pointer;
+    border: 1px solid light-dark(#d7d8de, #3b3d42);
+    color: inherit; background: light-dark(#fff, #232428);
+  }
+  button:hover:not(:disabled) { border-color: light-dark(#868a94, #777a83); }
+  button[aria-pressed="true"] {
+    color: light-dark(#07452b, #d3ffe5);
+    background: light-dark(#ddf6e8, #203c30);
+    border-color: light-dark(#97d4ad, #4f8d68);
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  #share { margin-left: auto; }
+  #screen {
+    display: block; width: min(100cqw, 160cqh); height: auto; aspect-ratio: 8/5;
+    background: #151618; border-radius: 7px; touch-action: none; user-select: none;
+  }
+  :focus-visible { outline: 2px solid #529bfd; outline-offset: 2px; }
+  #problem, #error { color: light-dark(#a21e1e, #ffaaa4); overflow-wrap: anywhere; }
+  .sr-only { position: absolute; width: 1px; height: 1px; margin: 0; overflow: hidden; clip-path: inset(50%); }
+  [hidden] { display: none !important; }
+</style>
+<main>
+  <div id="stage">
+    <div id="placeholder">
+      <span id="spinner" aria-hidden="true"></span>
+      <p id="status" role="status">Starting GNOME Shell…</p>
+      <p id="problem" role="alert" hidden></p>
+      <button id="retry" hidden>Try again</button>
+    </div>
+    <img id="screen" alt="Live GNOME desktop controls" aria-describedby="hint" draggable="false" tabindex="0" hidden>
+  </div>
+  <div id="toolbar" hidden>
+    <div id="note">
+      <p id="warning" role="status" hidden></p>
+      <p id="error" role="alert" hidden></p>
+    </div>
+    <button id="share" aria-pressed="false"
+      title="Let Codex see this desktop and send input while the tab is visible">Allow Codex</button>
+  </div>
+  <p id="hint" class="sr-only">Click the desktop to send keyboard input. Press Ctrl+Alt+Shift+Esc to focus the tab controls.</p>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const screen = $("screen"), share = $("share"), retry = $("retry"), main = document.querySelector("main");
+  const view = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
+  const pending = new Map();
+  const heldKeys = new Map();
+  const buttons = [1, 4, 2];
+  let origin = "*", nextId = 0, connected = false, attached = false, closed = false;
+  let onScreen = false, shown = false, epoch = 0, attaching = null, claimed = false, closing;
+  let state = null, seq = 0, frameTimer = 0, polling = false, failures = 0, revision = 0, busy = false;
+  let pointer = null, mouseButtons = 0, scrollRemainder = [0, 0];
+  let events = [], sendTimer = 0, sending = false;
+
+  function post(payload) {
+    window.parent.postMessage({jsonrpc: "2.0", ...payload}, origin);
+  }
+
+  function request(method, params, timeout = 7000) {
+    return new Promise((resolve, reject) => {
+      const id = ++nextId;
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error("Codex did not respond. The desktop tab can reconnect."));
+      }, timeout);
+      pending.set(id, {resolve, reject, timer});
+      post({id, method, params});
+    });
+  }
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window.parent || (origin !== "*" && event.origin !== origin)) return;
+    const message = event.data;
+    if (message?.jsonrpc !== "2.0") return;
+    if (message.method === "ui/resource-teardown" && Object.hasOwn(message, "id")) {
+      void teardown(message.id);
+    } else if (message.method === "ui/notifications/host-context-changed") {
+      applyContext(message.params);
+    } else if (message.method === "ping" && Object.hasOwn(message, "id")) {
+      post({id: message.id, result: {}});
+    } else if (!message.method && pending.has(message.id)) {
+      const call = pending.get(message.id);
+      clearTimeout(call.timer);
+      pending.delete(message.id);
+      if (message.error) call.reject(new Error(message.error.message));
+      else {
+        if (typeof event.origin === "string" && event.origin !== "null" && event.origin) origin = event.origin;
+        call.resolve(message.result);
+      }
+    }
+  });
+
+  async function tool(name, args, timeout) {
+    const result = await request("tools/call", {name, arguments: args}, timeout);
+    if (!result || result.isError) throw new Error(result?.content?.[0]?.text || "The desktop operation failed.");
+    return result.structuredContent;
+  }
+
+  function applyContext(context) {
+    const root = document.documentElement;
+    if (context?.theme === "light" || context?.theme === "dark") root.style.colorScheme = context.theme;
+    for (const name of ["--font-sans", "--color-background-primary", "--color-text-primary"]) {
+      const value = context?.styles?.variables?.[name];
+      if (typeof value === "string") root.style.setProperty(name, value);
+    }
+    for (const side of ["top", "right", "bottom", "left"]) {
+      const inset = context?.safeAreaInsets?.[side];
+      if (Number.isFinite(inset)) root.style.setProperty("--safe-" + side, Math.max(0, Math.min(128, inset)) + "px");
+    }
+  }
+
+  function error(message) {
+    const inDesktop = !screen.hidden;
+    for (const [id, active] of [["problem", !inDesktop], ["error", inDesktop]]) {
+      $(id).textContent = active ? message || "" : "";
+      $(id).hidden = !active || !message;
+    }
+  }
+
+  function forgetInput() {
+    events = [];
+    clearTimeout(sendTimer);
+    sendTimer = 0;
+    heldKeys.clear();
+    mouseButtons = 0;
+    pointer = null;
+    scrollRemainder = [0, 0];
+  }
+
+  function clearScreen() {
+    seq = 0;
+    screen.removeAttribute("src");
+    screen.hidden = $("toolbar").hidden = true;
+    $("placeholder").hidden = false;
+  }
+
+  function showLoading() {
+    $("status").textContent = "Starting GNOME Shell…";
+    retry.hidden = true;
+    $("spinner").hidden = false;
+    error();
+  }
+
+  function showFailure(message) {
+    $("spinner").hidden = true;
+    $("status").textContent = "Desktop unavailable";
+    retry.hidden = false;
+    error(message);
+  }
+
+  function render(next) {
+    if (!next || !["stopped", "starting", "running", "error"].includes(next.phase)) {
+      throw new Error("Codex returned an invalid desktop state.");
+    }
+    if (next.epoch !== epoch) return;
+    if (state?.sessionId !== next.sessionId || next.phase !== "running") {
+      forgetInput();
+      clearScreen();
+    }
+    state = next;
+    const running = state.phase === "running";
+    share.disabled = busy || !attached || !visible();
+    share.textContent = state.shared ? "Revoke Codex access" : "Allow Codex";
+    share.setAttribute("aria-pressed", String(state.shared));
+    const warnings = Array.isArray(state.warnings) ? state.warnings : [];
+    $("warning").hidden = !warnings.length;
+    $("warning").textContent = warnings.join(" ");
+    if (running && next.frame && next.seq > seq) {
+      seq = next.seq;
+      screen.src = "data:image/jpeg;base64," + next.frame;
+      screen.hidden = $("toolbar").hidden = false;
+      $("placeholder").hidden = true;
+    }
+    if (screen.hidden) {
+      if (state.phase === "error") showFailure(state.problem);
+      else showLoading();
+    }
+  }
+
+  function schedule(delay) {
+    clearTimeout(frameTimer);
+    if (!closed && attached) frameTimer = setTimeout(poll, delay);
+  }
+
+  function requestFrame() {
+    return tool("desktop_frame", {
+      view, visible: visible(), epoch, sessionId: state?.sessionId ?? null, after: seq,
+    });
+  }
+
+  async function poll() {
+    if (closed || !attached || polling) return;
+    polling = true;
+    const current = revision;
+    try {
+      const result = await requestFrame();
+      if (closed || current !== revision) return;
+      if (failures && result?.phase !== "error") error();
+      failures = 0;
+      render(result);
+    } catch (err) {
+      if (closed || current !== revision) return;
+      if (err.message.includes("disconnected")) {
+        await reconnect();
+      } else if (++failures >= 2) {
+        attached = false;
+        forgetInput();
+        clearScreen();
+        showFailure(err.message);
+      } else {
+        error(err.message);
+      }
+    } finally {
+      polling = false;
+      schedule(current !== revision ? 0 : !visible() ? 8000 : state?.phase === "running" ? 145 : 500);
+    }
+  }
+
+  async function reconnect() {
+    attached = false;
+    forgetInput();
+    clearScreen();
+    showLoading();
+    await attach();
+  }
+
+  async function attach() {
+    if (closed || attached || attaching || !visible()) return;
+    claimed = true;
+    attaching = tool("desktop_attach", {view, visible: true, epoch});
+    try {
+      const result = await attaching;
+      if (closed) return;
+      attached = true;
+      failures = 0;
+      error();
+      render(result);
+      schedule(0);
+    } catch (err) {
+      if (!closed) {
+        attached = false;
+        showFailure(err.message);
+      }
+    } finally {
+      attaching = null;
+    }
+  }
+
+  async function viewAction(action) {
+    if (busy || !attached || closed || !visible()) return;
+    busy = retry.disabled = share.disabled = true;
+    revision++;
+    error();
+    try {
+      const result = await tool("desktop_view", {view, action, epoch}, 10000);
+      if (closed) return;
+      render(result);
+    } catch (err) {
+      if (!closed && screen.hidden) showFailure(err.message);
+      else if (!closed) error(err.message);
+    } finally {
+      revision++;
+      busy = retry.disabled = false;
+      if (!closed && !screen.hidden) share.disabled = state.epoch !== epoch || !visible();
+      schedule(0);
+    }
+  }
+
+  share.addEventListener("click", (event) => {
+    if (event.isTrusted && state?.epoch === epoch) void viewAction(state.shared ? "unshare" : "share");
+  });
+  retry.addEventListener("click", async () => {
+    if (attached) {
+      await viewAction("retry");
+      return;
+    }
+    retry.disabled = true;
+    try {
+      showLoading();
+      if (connected) await attach();
+      else await initialize();
+    } finally {
+      retry.disabled = false;
+    }
+  });
+
+  function canInput() {
+    return attached && !closed && visible() && !screen.hidden && state?.epoch === epoch
+      && state.phase === "running";
+  }
+
+  function queue(event) {
+    if (!canInput()) return;
+    if (event.type === "move" && events.at(-1)?.type === "move") events.pop();
+    events.push(event);
+    if (events.length > 96) {
+      forgetInput();
+      events.push({type: "release"});
+      error("Input paused after a backlog. Click the desktop to resume.");
+    }
+    if (!sending && !sendTimer) sendTimer = setTimeout(flush, 12);
+  }
+
+  async function flush() {
+    sendTimer = 0;
+    if (sending || !events.length || !canInput()) return;
+    const desktop = state.sessionId;
+    const inputEpoch = epoch;
+    sending = true;
+    try {
+      await tool("desktop_ui_input", {view, epoch: inputEpoch, sessionId: desktop, events: events.splice(0, 32)});
+    } catch (err) {
+      const current = canInput() && inputEpoch === epoch && desktop === state.sessionId;
+      if (current) {
+        forgetInput();
+        error(err.message);
+        try {
+          await tool("desktop_ui_input", {view, epoch: inputEpoch, sessionId: desktop,
+            events: [{type: "release"}]}, 4000);
+        } catch {
+          if (canInput() && inputEpoch === epoch && desktop === state.sessionId) await reconnect();
+        }
+      }
+    } finally {
+      sending = false;
+      if (events.length && attached && !closed) sendTimer = setTimeout(flush, 12);
+    }
+  }
+
+  function move(event) {
+    const rect = screen.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const {width, height} = state;
+    queue({
+      type: "move",
+      x: Math.max(0, Math.min(width - 1, (event.clientX - rect.left) * width / rect.width)),
+      y: Math.max(0, Math.min(height - 1, (event.clientY - rect.top) * height / rect.height)),
+    });
+  }
+
+  function syncButtons(mask) {
+    const before = mouseButtons;
+    mouseButtons = mask;
+    for (const [button, bit] of buttons.entries()) {
+      if ((before & bit) !== (mask & bit)) queue({type: "button", button, pressed: Boolean(mask & bit)});
+    }
+  }
+
+  screen.addEventListener("contextmenu", event => event.preventDefault());
+  screen.addEventListener("pointerdown", (event) => {
+    if (!canInput() || !event.isPrimary || event.button < 0 || event.button > 2) return;
+    event.preventDefault();
+    screen.focus({preventScroll: true});
+    screen.setPointerCapture(event.pointerId);
+    pointer = event.pointerId;
+    move(event);
+    syncButtons(event.buttons);
+  });
+  screen.addEventListener("pointermove", (event) => {
+    if (!canInput() || !event.isPrimary || (pointer !== null && pointer !== event.pointerId)) return;
+    move(event);
+    if (pointer !== null) syncButtons(event.buttons);
+  });
+  screen.addEventListener("pointerup", (event) => {
+    if (!canInput() || pointer !== event.pointerId) return;
+    move(event);
+    syncButtons(0);
+    pointer = null;
+  });
+  function release() {
+    const held = mouseButtons || heldKeys.size;
+    heldKeys.clear();
+    mouseButtons = 0;
+    pointer = null;
+    if (held) queue({type: "release"});
+  }
+  screen.addEventListener("pointercancel", release);
+  screen.addEventListener("lostpointercapture", (event) => {
+    if (pointer === event.pointerId) release();
+  });
+  screen.addEventListener("wheel", (event) => {
+    if (!canInput()) return;
+    event.preventDefault();
+    move(event);
+    const scale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? screen.clientHeight : 1;
+    for (const [axis, amount] of [event.deltaY, event.deltaX].entries()) {
+      scrollRemainder[axis] += amount * scale;
+      const steps = Math.max(-8, Math.min(8, Math.trunc(scrollRemainder[axis] / 40)));
+      if (steps) {
+        scrollRemainder[axis] %= 40;
+        queue({type: "scroll", axis, steps});
+      }
+    }
+  }, {passive: false});
+
+  const named = {
+    Enter: "Return", Backspace: "BackSpace", ArrowLeft: "Left", ArrowRight: "Right",
+    ArrowUp: "Up", ArrowDown: "Down", PageUp: "Page_Up", PageDown: "Page_Down",
+    CapsLock: "Caps_Lock", ContextMenu: "Menu", PrintScreen: "Print", ScrollLock: "Scroll_Lock",
+    NumLock: "Num_Lock", AltGraph: "ISO_Level3_Shift",
+  };
+  const modifiers = {Shift: "Shift", Control: "Control", Alt: "Alt", Meta: "Super"};
+
+  screen.addEventListener("keydown", (event) => {
+    if (!canInput() || event.isComposing || ["Unidentified", "Dead", "Process"].includes(event.key)) return;
+    if (event.key === "Escape" && event.ctrlKey && event.altKey && event.shiftKey) {
+      event.preventDefault();
+      share.focus();
+      return;
+    }
+    const code = event.code || event.key;
+    const key = Object.hasOwn(modifiers, event.key)
+      ? modifiers[event.key] + (event.location === 2 ? "_R" : "_L")
+      : (Object.hasOwn(named, event.key) ? named[event.key] : event.key);
+    if (!key || (Array.from(key).length !== 1 && !/^[A-Za-z0-9_]{2,32}$/.test(key))) return;
+    event.preventDefault();
+    if (event.repeat || heldKeys.has(code)) return;
+    heldKeys.set(code, key);
+    queue({type: "key", key, pressed: true});
+  });
+  screen.addEventListener("keyup", (event) => {
+    const code = event.code || event.key;
+    const key = heldKeys.get(code);
+    if (!key) return;
+    event.preventDefault();
+    heldKeys.delete(code);
+    queue({type: "key", key, pressed: false});
+  });
+  screen.addEventListener("blur", release);
+  window.addEventListener("blur", release);
+  function visible() {
+    return onScreen && !document.hidden;
+  }
+
+  function visibilityChanged() {
+    if (shown === visible()) return;
+    shown = visible();
+    epoch++;
+    revision++;
+    if (!shown) {
+      share.disabled = true;
+      forgetInput();
+      // Revoke access even if a frame request is in flight.
+      if (claimed && !closed) void requestFrame().catch(() => {});
+    } else if (connected && !attached && retry.hidden) {
+      void attach();
+    }
+    schedule(0);
+  }
+  document.addEventListener("visibilitychange", visibilityChanged);
+  const intersection = new IntersectionObserver(([entry]) => {
+    onScreen = entry.isIntersecting && entry.intersectionRect.width > 0 && entry.intersectionRect.height > 0;
+    visibilityChanged();
+  });
+  intersection.observe(main);
+
+  const resize = new ResizeObserver(([entry]) => {
+    if (connected && !closed && entry.target.offsetWidth && entry.target.offsetHeight) post({
+      method: "ui/notifications/size-changed", params: {
+      width: Math.ceil(entry.target.offsetWidth), height: Math.ceil(entry.target.offsetHeight),
+      },
+    });
+  });
+
+  async function teardown(id) {
+    if (!closed) {
+      closed = true;
+      attached = false;
+      clearTimeout(frameTimer);
+      forgetInput();
+      resize.disconnect();
+      intersection.disconnect();
+      const startup = attaching;
+      const closeTab = () => tool("desktop_view", {view, action: "close", epoch}, 8000);
+      closing = claimed ? closeTab().then(async () => {
+        if (startup) {
+          await startup.catch(() => {});
+          await closeTab();
+        }
+      }) : Promise.resolve();
+    }
+    try {
+      await closing;
+      if (id !== undefined) post({id, result: {}});
+    } catch {
+      // The server expires a tab if teardown is interrupted.
+      if (id !== undefined) post({id, error: {code: -32000, message: "GNOME Shell is still shutting down."}});
+    }
+  }
+  window.addEventListener("pagehide", () => void teardown());
+
+  async function initialize() {
+    try {
+      const initialized = await request("ui/initialize", {
+        appInfo: {name: "GNOME Shell", version: "__GNOME_VERSION__"},
+        appCapabilities: {availableDisplayModes: ["inline", "fullscreen"]},
+        protocolVersion: "2026-01-26",
+      });
+      if (closed) return;
+      post({method: "ui/notifications/initialized"});
+      if (!initialized?.hostCapabilities?.serverTools) {
+        throw new Error("This Codex view does not provide MCP App tools. Update Codex and reopen the tab.");
+      }
+      connected = true;
+      applyContext(initialized.hostContext);
+      resize.observe(main);
+      await attach();
+    } catch (err) {
+      if (!closed) showFailure(err.message);
+    }
+  }
+  void initialize();
+</script>
+</html>

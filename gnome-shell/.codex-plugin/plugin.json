@@ -1,0 +1,15 @@
+{
+  "name": "gnome-shell",
+  "version": "0.3.0",
+  "description": "Use a disposable offline GNOME desktop together in a local Codex tab.",
+  "interface": {
+    "displayName": "GNOME Shell",
+    "shortDescription": "Shared GNOME desktop",
+    "longDescription": "Open an isolated GNOME Shell session in a Codex tab. Use the desktop with mouse and keyboard, and choose when Codex can see or operate it.",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive"
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "gnome-shell": {
+      "type": "stdio",
+      "command": "./launch-gnome-shell",
+      "cwd": "${PLUGIN_ROOT}"
+    }
+  }
+}

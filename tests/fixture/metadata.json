@@ -1,0 +1,7 @@
+{
+  "uuid": "audit-fixture@local",
+  "name": "GNOME Shell Audit Fixture",
+  "description": "Displays local integration test results inside an isolated session.",
+  "shell-version": ["50"],
+  "version": 1
+}

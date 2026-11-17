@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "gnome-shell",
+  "version": "0.3.0",
+  "description": "Use a disposable offline GNOME desktop together in a local Codex tab.",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "GNOME Shell",
+        "shortDescription": "Shared GNOME desktop",
+        "longDescription": "Open an isolated GNOME Shell session in a Codex tab. Use the desktop with mouse and keyboard, and choose when Codex can see or operate it.",
+        "category": "Developer Tools",
+        "capabilities": [
+          "Interactive"
+        ]
+      }
+    }
+  }
+}
